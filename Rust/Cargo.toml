@@ -1,0 +1,31 @@
+[package]
+name = "image_processing_core"
+version = "0.1.0"
+authors = ["Embedded Systems Team"]
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+name = "image_processing_core"
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
+stm32h7xx-hal = { version = "0.15", features = ["stm32h743v", "rt"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[build-dependencies]
+cc = "1.0"

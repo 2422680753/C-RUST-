@@ -1,0 +1,22 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+ar = "arm-none-eabi-ar"
+linker = "arm-none-eabi-gcc"
+runner = "arm-none-eabi-gdb"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true
+
+[profile.dev]
+opt-level = 0
+debug = true
