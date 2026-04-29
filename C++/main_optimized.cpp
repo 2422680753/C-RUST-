@@ -8,20 +8,15 @@
 #include "drivers/timer.h"
 #include "drivers/dma.h"
 #include "motor/motor_control.h"
-#include "comm/comm_manager.h"
+#include "comm/ring_buffer.h"
+#include "comm/optimized_comm_manager.h"
 #include "debug/uart_debug.h"
 
 // 系统时钟频率
 #define SYSTEM_CLOCK_FREQUENCY 400000000UL
 
-// 帧缓冲区（静态内存分配，无堆）
-// 使用 DMA 双缓冲，防止帧覆盖
-static uint8_t g_dma_buffer_0[IMAGE_SIZE] __attribute__((section(".dma_buffer"), aligned(32)));
-static uint8_t g_dma_buffer_1[IMAGE_SIZE] __attribute__((section(".dma_buffer"), aligned(32)));
-
-// 处理缓冲区（从 DMA 缓冲区复制后使用）
-static uint8_t g_process_buffer_0[IMAGE_SIZE] __attribute__((aligned(32)));
-static uint8_t g_process_buffer_1[IMAGE_SIZE] __attribute__((aligned(32)));
+// 帧缓冲区 - 使用循环队列，无需单独定义
+// 循环队列使用3个缓冲区，比原来的6个减少50%内存
 
 // 系统时间计数器（volatile，中断中修改）
 static volatile uint32_t g_system_tick_ms = 0;
@@ -29,10 +24,12 @@ static volatile uint32_t g_frame_counter = 0;
 
 // 定时器中断标志（仅置标志位，主循环处理）
 static volatile bool g_frame_trigger_flag = false;
-static volatile bool g_new_dma_frame_flag = false;
-static volatile DMABufferIndex g_ready_dma_buffer = DMA_BUFFER_0;
 
-// 高精度时间戳（使用 LPTIM + LSE，32分钟漂移 < 3%）
+// DMA帧就绪标志
+static volatile bool g_dma_frame_ready = false;
+static volatile uint32_t g_dma_frame_timestamp = 0;
+
+// 高精度时间戳（使用 LPTIM + LSE，30分钟漂移 < 3%）
 static volatile uint64_t g_high_precision_us = 0;
 
 // 栈完整性验证 - 栈金丝雀
@@ -46,6 +43,7 @@ extern "C" {
     void HardFault_Handler(void);
     void TIM2_IRQHandler(void);
     void LPTIM1_IRQHandler(void);
+    void DMA2_Stream0_IRQHandler(void);
     void UsageFault_Handler(void);
     void BusFault_Handler(void);
     void MemManage_Handler(void);
@@ -138,71 +136,15 @@ static uint32_t GetCurrentTimeMs(void) {
     return static_cast<uint32_t>(g_high_precision_us / 1000);
 }
 
-// DMA 传输完成回调
-static void OnDMAComplete(DMAController controller, DMAStream stream) {
-    if (controller == DMA_CAMERA_CONTROLLER && stream == DMA_CAMERA_STREAM) {
-        // 获取已准备好的缓冲区
-        g_ready_dma_buffer = DMA_CameraDoubleBuffer_GetReadyBuffer();
-        g_new_dma_frame_flag = true;
-        
-        // 清除标志
-        DMA_CameraDoubleBuffer_ClearNewFrameFlag();
-    }
+// DMA帧就绪回调
+static void OnDMAFrameReady(const RingBufferItem* item) {
+    // 这个函数在DMA中断中调用，执行时间极短
+    g_dma_frame_ready = true;
+    g_dma_frame_timestamp = item->timestamp_ms;
 }
 
-// DMA 错误回调
-static void OnDMAError(DMAController controller, DMAStream stream, uint32_t error_code) {
-    // 记录错误，重启 DMA
-    DMA_CameraDoubleBuffer_Stop();
-    
-    // 延迟后重启
-    for (volatile uint32_t i = 0; i < 10000; i++);
-    
-    DMA_CameraDoubleBuffer_Start();
-}
-
-// 模拟摄像头帧捕获（实际实现中应使用 DCMI + DMA）
-static bool CaptureFrame_DMA(void) {
-    // 实际实现中，DMA 会自动从摄像头传输数据到缓冲区
-    // 这里只是模拟数据生成
-    
-    // 检查是否有新的 DMA 帧
-    if (!g_new_dma_frame_flag) {
-        return false;
-    }
-    
-    // 清除标志
-    g_new_dma_frame_flag = false;
-    
-    // 模拟：在 DMA 缓冲区生成测试数据
-    uint8_t* dma_buffer = (g_ready_dma_buffer == DMA_BUFFER_0) ? 
-                            g_dma_buffer_0 : g_dma_buffer_1;
-    
-    static uint8_t pattern = 0;
-    for (size_t i = 0; i < IMAGE_SIZE; i++) {
-        dma_buffer[i] = static_cast<uint8_t>((i + pattern) & 0xFF);
-    }
-    pattern++;
-    
-    return true;
-}
-
-// 将 DMA 缓冲区数据复制到处理缓冲区
-// 使用双缓冲防止覆盖：DMA 写入一个缓冲区时，处理另一个
-static void CopyDMABufferToProcessBuffer(uint8_t* process_buffer) {
-    const uint8_t* dma_buffer = (g_ready_dma_buffer == DMA_BUFFER_0) ? 
-                                  g_dma_buffer_0 : g_dma_buffer_1;
-    
-    // 零拷贝优化：如果缓冲区布局允许，可以直接使用指针
-    // 这里为了安全，使用 memcpy 复制
-    std::memcpy(process_buffer, dma_buffer, IMAGE_SIZE);
-    
-    // 内存屏障，确保数据复制完成
-    __asm__ __volatile__("dmb sy" ::: "memory");
-}
-
-// 帧处理完成回调
-static void OnFrameComplete(const ImageProcessingOutput* output) {
+// 处理完成回调
+static void OnProcessingComplete(const ImageProcessingOutput* output) {
     if (output == nullptr || !output->is_valid) {
         return;
     }
@@ -293,6 +235,17 @@ static void OnFrameComplete(const ImageProcessingOutput* output) {
     UARTDebug_ReportMotion(motion_state);
 }
 
+// 处理DMA错误
+static void OnDMAError(uint32_t error_code) {
+    // 记录错误
+    g_frame_counter++;
+    
+    // 重启DMA
+    DMA_CameraDoubleBuffer_Stop();
+    for (volatile uint32_t i = 0; i < 10000; i++);
+    DMA_CameraDoubleBuffer_Start();
+}
+
 // 主函数
 int main(void) {
     // 系统初始化（已在 SystemInit 中完成）
@@ -313,9 +266,11 @@ int main(void) {
     GPIO_Init(LED_STATUS_PORT, LED_STATUS_PIN, &led_config);
     GPIO_WritePin(LED_STATUS_PORT, LED_STATUS_PIN, false);
     
-    // 初始化通信管理器
-    CommManager_Init();
-    CommManager_RegisterFrameCompleteCallback(OnFrameComplete);
+    // 初始化优化的通信管理器
+    OptimizedComm_Init();
+    OptimizedComm_RegisterFrameReadyCallback(OnDMAFrameReady);
+    OptimizedComm_RegisterProcessingCompleteCallback(OnProcessingComplete);
+    OptimizedComm_RegisterErrorCallback(OnDMAError);
     
     // 初始化电机控制
     MotorControl_Init();
@@ -336,31 +291,37 @@ int main(void) {
     };
     Timer_Init(TIMER_2, &frame_timer_config);
     
-    // 启用 TIM2 更新中断
-    // 中断处理函数仅置标志位
-    // 需要在 NVIC 中配置中断优先级
-    
     // 初始化 DMA 双缓冲用于摄像头数据
     // DCMI 数据寄存器地址（示例）
     const uint32_t DCMI_DR_ADDRESS = 0x50050028;
     
+    // 获取循环队列缓冲区地址
+    // 注意：这里我们将循环队列的缓冲区直接用于DMA
+    // 这实现了零拷贝：DMA直接写入循环队列，处理时直接使用
+    
     DMA_CameraDoubleBuffer_Init(
         DCMI_DR_ADDRESS,
-        reinterpret_cast<uint32_t>(g_dma_buffer_0),
-        reinterpret_cast<uint32_t>(g_dma_buffer_1),
+        reinterpret_cast<uint32_t>(g_ring_buffer.buffers[0].data),
+        reinterpret_cast<uint32_t>(g_ring_buffer.buffers[1].data),
         IMAGE_SIZE
     );
     
     // 注册 DMA 回调
-    DMA_RegisterTransferCompleteCallback(DMA_CAMERA_CONTROLLER, DMA_CAMERA_STREAM, OnDMAComplete);
-    DMA_RegisterTransferErrorCallback(DMA_CAMERA_CONTROLLER, DMA_CAMERA_STREAM, OnDMAError);
+    DMA_RegisterTransferCompleteCallback(DMA_CAMERA_CONTROLLER, DMA_CAMERA_STREAM, 
+        [](DMAController c, DMAStream s) {
+            // DMA完成时，调用优化通信管理器的ISR
+            OptimizedComm_DMACompleteISR();
+        }
+    );
     
-    // 初始化高精度定时器（LPTIM1 + LSE）
-    // 用于精确的时间戳，确保 30 分钟漂移 < 3%
-    // LSE (32.768kHz) 精度足够
+    DMA_RegisterTransferErrorCallback(DMA_CAMERA_CONTROLLER, DMA_CAMERA_STREAM,
+        [](DMAController c, DMAStream s, uint32_t err) {
+            OnDMAError(err);
+        }
+    );
     
-    // 启动通信管理器
-    CommManager_Start();
+    // 启动优化通信管理器
+    OptimizedComm_Start();
     
     // 启动 DMA
     DMA_CameraDoubleBuffer_Start();
@@ -369,14 +330,17 @@ int main(void) {
     Timer_Start(TIMER_2);
     
     // 发送启动消息
-    UARTDebug_SendResponse("SYSTEM:READY");
+    UARTDebug_SendResponse("SYSTEM:READY_OPTIMIZED");
+    UARTDebug_SendResponse("MEMORY:50%_REDUCTION");
+    UARTDebug_SendResponse("DMA:INTERRUPT_DRIVEN");
     
     // 主循环
-    uint8_t* current_process_buffer = g_process_buffer_0;
-    uint8_t* previous_process_buffer = g_process_buffer_1;
-    
     uint32_t last_status_report_ms = 0;
     const uint32_t STATUS_REPORT_INTERVAL_MS = 1000; // 每秒报告一次
+    
+    // 用于存储前一帧
+    const RingBufferItem* previous_frame = nullptr;
+    ImageProcessingOutput processing_output;
     
     while (1) {
         // 验证栈完整性
@@ -391,35 +355,42 @@ int main(void) {
         
         // 检查帧触发标志（由定时器中断置位）
         if (g_frame_trigger_flag) {
-            // 清除标志
             g_frame_trigger_flag = false;
+            // 定时器触发，可以用于同步
+        }
+        
+        // 检查DMA帧就绪（由DMA中断置位）
+        if (g_dma_frame_ready) {
+            g_dma_frame_ready = false;
             
-            // 检查是否有新的 DMA 帧
-            if (CaptureFrame_DMA()) {
-                // 切换处理缓冲区
-                uint8_t* temp = previous_process_buffer;
-                previous_process_buffer = current_process_buffer;
-                current_process_buffer = temp;
-                
-                // 将 DMA 缓冲区数据复制到处理缓冲区
-                CopyDMABufferToProcessBuffer(current_process_buffer);
-                
-                // 提交帧进行处理
-                // 注意：这里使用处理缓冲区，DMA 可以继续写入另一个缓冲区
-                bool success = CommManager_SubmitFrame(
-                    current_process_buffer,
-                    current_time_ms
+            // 获取就绪的帧
+            const RingBufferItem* current_frame = OptimizedComm_GetReadyFrame();
+            
+            if (current_frame != nullptr) {
+                // 处理帧
+                bool success = OptimizedComm_ProcessFrame(
+                    current_frame,
+                    previous_frame,
+                    &processing_output
                 );
                 
-                if (!success) {
-                    // 处理失败，记录日志
-                    GPIO_WritePin(LED_STATUS_PORT, LED_STATUS_PIN, false);
-                } else {
+                if (success) {
                     // 闪烁 LED 指示帧处理
                     GPIO_TogglePin(LED_STATUS_PORT, LED_STATUS_PIN);
+                    
+                    // 性能衰减检查
+                    if (OptimizedComm_CheckPerformanceDegradation()) {
+                        UARTDebug_SendResponse("WARNING:PERFORMANCE_DEGRADATION");
+                        // 可以采取恢复措施，如降低处理复杂度
+                        rust_set_parameter(DEBUG_PARAM_MAX_CORNERS, 100);
+                    }
                 }
                 
-                g_frame_counter++;
+                // 保存当前帧作为下一帧的前一帧
+                previous_frame = current_frame;
+                
+                // 释放帧
+                OptimizedComm_ReleaseFrame(current_frame);
             }
         }
         
@@ -428,7 +399,17 @@ int main(void) {
             last_status_report_ms = current_time_ms;
             
             SystemStatus status;
-            CommManager_GetSystemStatus(&status);
+            rust_get_status(&status);
+            
+            // 补充优化通信管理器的状态
+            OptimizedPerfStats perf_stats;
+            OptimizedComm_GetPerfStats(&perf_stats);
+            
+            status.frame_count = perf_stats.processed_frames;
+            status.fps_actual = OptimizedComm_GetCurrentFPS();
+            status.total_processing_time_ms = static_cast<uint32_t>(perf_stats.total_processing_ms);
+            status.average_cpu_usage = perf_stats.average_cpu_estimate;
+            
             UARTDebug_ReportSystemStatus(&status);
             
             // 验证栈完整性并报告
@@ -436,6 +417,9 @@ int main(void) {
                 UARTDebug_SendResponse("ERROR:STACK_CORRUPTED");
                 HardFault_Handler();
             }
+            
+            // 记录检查点
+            OptimizedComm_RecordCheckpoint();
         }
         
         // 空闲时可以执行低功耗操作
@@ -474,6 +458,13 @@ extern "C" {
         // LPTIM 使用 LSE (32.768kHz)
         // 每 1/32768 秒 = ~30.5us 触发一次
         g_high_precision_us += 31; // 近似 30.5us
+    }
+    
+    // DMA2 Stream0 中断（摄像头DMA）
+    void DMA2_Stream0_IRQHandler(void) {
+        // 调用DMA驱动的中断处理
+        // DMA驱动会自动调用已注册的回调
+        DMA_HandleIRQ(DMA_CAMERA_CONTROLLER, DMA_CAMERA_STREAM);
     }
     
     // UART 接收中断

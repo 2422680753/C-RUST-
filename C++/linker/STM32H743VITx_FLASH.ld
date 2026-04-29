@@ -4,6 +4,11 @@
  * RAM: 1MB (0x24000000 - 0x240FFFFF)
  * DTCM: 128KB (0x20000000 - 0x2001FFFF)
  * ITCM: 64KB (0x00000000 - 0x0000FFFF)
+ * 
+ * 支持：
+ * - 栈金丝雀（Stack Canary）用于栈完整性验证
+ * - DMA 缓冲区区域（32字节对齐）
+ * - 无堆内存
  */
 
 ENTRY(Reset_Handler)
@@ -12,8 +17,11 @@ ENTRY(Reset_Handler)
 _estack = ORIGIN(RAM) + LENGTH(RAM);    /* end of RAM */
 
 /* Generate a link error if heap and stack don't fit into RAM */
-_Min_Heap_Size = 0x0;      /* No heap required */
-_Min_Stack_Size = 0x400;   /* 1KB stack */
+_Min_Heap_Size = 0x0;      /* No heap required - 不使用堆内存 */
+_Min_Stack_Size = 0x1000;  /* 4KB stack */
+
+/* 栈金丝雀大小 */
+_Stack_Canary_Size = 0x8;  /* 8 bytes for two 32-bit canaries */
 
 /* Specify the memory areas */
 MEMORY
@@ -94,14 +102,58 @@ SECTIONS
   /*
    * Stack and heap in RAM
    * No heap is used in this project
+   * 
+   * 栈布局（从低地址到高地址）：
+   * - 底部金丝雀 (stack_canary_bottom)
+   * - 栈区域 (_sstack 到 _estack)
+   * - 顶部金丝雀 (stack_canary_top)
    */
-  .stack_dummy (NOLOAD) :
+  
+  /* 栈底部金丝雀 - 在栈开始之前 */
+  .stack_canary_bottom (NOLOAD) :
+  {
+    . = ALIGN(4);
+    PROVIDE ( _stack_canary_bottom = . );
+    *(.stack_canary)
+    . = ALIGN(4);
+  } >RAM
+
+  /*
+   * 实际栈区域
+   * 注意：栈从高地址向低地址增长
+   * 所以 _sstack 是栈的最低地址，_estack 是栈的最高地址
+   */
+  .stack (NOLOAD) :
   {
     . = ALIGN(8);
     PROVIDE ( _sstack = . );
     . = . + _Min_Stack_Size;
     . = ALIGN(8);
     PROVIDE ( _estack = . );
+  } >RAM
+
+  /* 栈顶部金丝雀 - 在栈结束之后 */
+  .stack_canary_top (NOLOAD) :
+  {
+    . = ALIGN(4);
+    PROVIDE ( _stack_canary_top = . );
+    *(.stack_canary)
+    . = ALIGN(4);
+  } >RAM
+
+  /*
+   * DMA 缓冲区区域
+   * 必须 32 字节对齐以支持 Cache 维护操作
+   * 放置在 .data 之前以确保地址稳定性
+   */
+  .dma_buffer (NOLOAD) :
+  {
+    . = ALIGN(32);
+    PROVIDE ( _s_dma_buffer = . );
+    *(.dma_buffer)
+    *(.dma_buffer.*)
+    . = ALIGN(32);
+    PROVIDE ( _e_dma_buffer = . );
   } >RAM
 
   /* Initialized data sections goes into RAM, load LMA copy after code */
@@ -134,12 +186,13 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
 
-  /* User_heap_stack section, used to check that there is enough RAM left */
+  /* User_heap_stack section - 标记为 0 大小，不使用堆 */
   ._user_heap_stack (NOLOAD) :
   {
     . = ALIGN(8);
     PROVIDE ( end = . );
     PROVIDE ( _end = . );
+    /* 不分配堆内存 */
     . = . + _Min_Heap_Size;
     . = ALIGN(8);
   } >RAM
@@ -150,7 +203,28 @@ SECTIONS
     libc.a ( * )
     libm.a ( * )
     libgcc.a ( * )
+    /* 丢弃堆相关的段 */
+    *(.heap)
+    *(.heap*)
   }
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }
+
+/*
+ * 验证链接时断言
+ * 确保关键约束条件满足
+ */
+
+/* 确保栈大小足够 */
+ASSERT(_Min_Stack_Size >= 0x400, "Stack size too small! Minimum 1KB required.")
+
+/* 确保不使用堆 */
+ASSERT(_Min_Heap_Size == 0, "Heap is not allowed in this project!")
+
+/* 确保 DMA 缓冲区 32 字节对齐 */
+ASSERT((_s_dma_buffer & 0x1F) == 0, "DMA buffer must be 32-byte aligned!")
+
+/* 确保金丝雀在正确位置 */
+ASSERT(_stack_canary_bottom < _sstack, "Stack canary bottom must be before stack!")
+ASSERT(_stack_canary_top > _estack, "Stack canary top must be after stack!")
